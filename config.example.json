@@ -1,0 +1,11 @@
+{
+  "imap_server": "imap.exmail.qq.com",
+  "imap_port": 993,
+  "username": "your_email@example.com",
+  "password": "your_app_password",
+  "folder": "INBOX",
+  "pushover_app_token": "your_pushover_app_token",
+  "pushover_user_key": "your_pushover_user_key",
+  "proxy_url": "",
+  "heartbeat_interval": 15
+}

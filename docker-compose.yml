@@ -1,0 +1,35 @@
+
+services:
+  mail-monitor:
+    build: .
+    container_name: mail-monitor
+    network_mode: "host"
+    restart: unless-stopped
+    # 优先使用 .env 文件中的环境变量，如果没有则使用 environment 配置或配置文件的默认值
+    env_file:
+      - .env
+    # 你可以选择不使用 .env 文件，直接在下方 environment 注入
+    environment:
+      - IMAP_SERVER=${IMAP_SERVER:-}
+      - IMAP_PORT=${IMAP_PORT:-993}
+      - EMAIL_USERNAME=${EMAIL_USERNAME:-}
+      - EMAIL_PASSWORD=${EMAIL_PASSWORD:-}
+      - MAIL_FOLDER=${MAIL_FOLDER:-INBOX}
+      - PUSHOVER_APP_TOKEN=${PUSHOVER_APP_TOKEN:-}
+      - PUSHOVER_USER_KEY=${PUSHOVER_USER_KEY:-}
+      - PROXY_URL=${PROXY_URL:-}
+      - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-15}
+      - CONFIG_FILE=${CONFIG_FILE:-/app/config.json}
+    volumes:
+      # 同步宿主机时区
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      # 将宿主机的 ./logs 挂载到容器中，持久化日志
+      - ./logs:/app/logs
+      # 如果你希望通过挂载 json 配置文件而不是环境变量的方式启动，请取消下方注释并准备好本地的 config.json
+      # - ./config.json:/app/config.json:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
