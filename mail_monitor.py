@@ -210,12 +210,15 @@ class MailMonitor:
                 # 使用代理时，某些底层实现可能会在 recv 时抛出 TimeoutError 而不是 socket.timeout
                 sock.settimeout(1.0)
                 data = sock.recv(4096)
-                if data:
-                    text = data.decode(errors="ignore")
-                    if "EXISTS" in text or "RECENT" in text:
-                        log.info(f"[*] 检测到服务器信箱变化信号")
-                        self.exit_idle(tag)
-                        return "NEW_MAIL"
+                if not data:
+                    log.warning("Socket 收到空数据 (EOF)，连接已被防火墙或对端悄悄切断。")
+                    return "ERROR"
+                    
+                text = data.decode(errors="ignore")
+                if "EXISTS" in text or "RECENT" in text:
+                    log.info(f"[*] 检测到服务器信箱变化信号")
+                    self.exit_idle(tag)
+                    return "NEW_MAIL"
             except (socket.timeout, TimeoutError):
                 # 正常超时，继续下一轮循环以检查心跳
                 continue
