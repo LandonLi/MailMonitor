@@ -7,5 +7,6 @@
   "pushover_app_token": "your_pushover_app_token",
   "pushover_user_key": "your_pushover_user_key",
   "proxy_url": "",
-  "heartbeat_interval": 15
+  "heartbeat_interval": 15,
+  "dry_run": false
 }

@@ -7,10 +7,12 @@ import time
 import ssl
 import logging
 import socket
+import select
 import requests
 import os
 import json
 import sys
+import re
 from email.header import decode_header
 from pathlib import Path
 from urllib.parse import urlparse
@@ -45,45 +47,73 @@ def setup_logger():
 
 log = setup_logger()
 
-def configure_global_proxy(proxy_url):
-    """配置全局 Socket 代理 (用于 IMAP 连接)"""
+UID_PATTERN = re.compile(r"\bUID\s+(\d+)\b", re.IGNORECASE)
+
+
+def parse_proxy_settings(proxy_url):
     if not proxy_url:
-        return
-        
+        return None
+
     if not HAS_SOCKS:
         log.error("未安装 PySocks 库，无法启用代理！请执行: pip install PySocks")
         sys.exit(1)
-        
+
     try:
         parsed = urlparse(proxy_url)
-        scheme = parsed.scheme.lower()
-        
-        if scheme in ('socks5', 'socks5h'):
+        scheme = (parsed.scheme or "").lower()
+
+        if scheme in ("socks5", "socks5h"):
             proxy_type = socks.SOCKS5
-        elif scheme == 'socks4':
+        elif scheme == "socks4":
             proxy_type = socks.SOCKS4
-        elif scheme in ('http', 'https'):
+        elif scheme in ("http", "https"):
             proxy_type = socks.HTTP
         else:
-            log.warning(f"不支持的代理协议: {scheme}，代理可能无法正常工作。")
-            return
-            
-        kwargs = {
-            'proxy_type': proxy_type,
-            'addr': parsed.hostname,
-            'port': parsed.port,
-            'rdns': True  # 关键：开启远程 DNS 解析，防止本地解析污染分流策略
+            raise ValueError(f"不支持的代理协议: {scheme or '<empty>'}")
+
+        if not parsed.hostname or not parsed.port:
+            raise ValueError("代理地址缺少主机名或端口")
+
+        settings = {
+            "proxy_type": proxy_type,
+            "proxy_addr": parsed.hostname,
+            "proxy_port": parsed.port,
+            "proxy_username": parsed.username,
+            "proxy_password": parsed.password,
+            "proxy_rdns": True,
         }
-        if parsed.username:
-            kwargs['username'] = parsed.username
-            kwargs['password'] = parsed.password
-            
-        socks.set_default_proxy(**kwargs)
-        socket.socket = socks.socksocket
-        log.info(f"已启用网络代理 -> {proxy_url} (IMAP 将通过此代理连接)")
+        log.info(f"已启用网络代理 -> {proxy_url} (仅 IMAP/HTTP 请求通过此代理)")
+        return settings
     except Exception as e:
         log.error(f"解析代理地址失败: {e}")
         sys.exit(1)
+
+
+class ProxyMixin:
+    def __init__(self, *args, proxy_settings=None, **kwargs):
+        self.proxy_settings = proxy_settings
+        super().__init__(*args, **kwargs)
+
+    def _create_socket(self, timeout):
+        if not self.proxy_settings:
+            return super()._create_socket(timeout)
+
+        if timeout is not None and not timeout:
+            raise ValueError("Non-blocking socket (timeout=0) is not supported")
+
+        return socks.create_connection(
+            (self.host, self.port),
+            timeout=timeout,
+            **self.proxy_settings,
+        )
+
+
+class ProxyIMAP4(ProxyMixin, imaplib.IMAP4):
+    pass
+
+
+class ProxyIMAP4_SSL(ProxyMixin, imaplib.IMAP4_SSL):
+    pass
 
 
 class MailMonitor:
@@ -91,7 +121,10 @@ class MailMonitor:
         self.cfg = cfg
         self.imap = None
         self.idle_tag = 0
-        
+        self.last_seen_uid = None
+        self.proxy_settings = parse_proxy_settings(cfg.get("proxy_url"))
+        self.dry_run = bool(cfg.get("dry_run", False))
+
         # Requests 代理配置
         self.req_proxies = None
         if cfg.get("proxy_url"):
@@ -128,26 +161,39 @@ class MailMonitor:
         while True:
             try:
                 if self.imap:
-                    try: self.imap.logout()
-                    except: pass
-                
+                    try:
+                        self.imap.logout()
+                    except Exception:
+                        pass
+
                 log.info(f"正在连接到 IMAP 服务器 -> {self.cfg['imap_server']}:{self.cfg['imap_port']} ...")
                 context = ssl.create_default_context()
-                
+
                 if self.cfg['imap_port'] == 993:
-                    self.imap = imaplib.IMAP4_SSL(self.cfg['imap_server'], self.cfg['imap_port'], ssl_context=context)
+                    self.imap = ProxyIMAP4_SSL(
+                        self.cfg['imap_server'],
+                        self.cfg['imap_port'],
+                        ssl_context=context,
+                        proxy_settings=self.proxy_settings,
+                    )
                 else:
-                    self.imap = imaplib.IMAP4(self.cfg['imap_server'], self.cfg['imap_port'])
-                
+                    self.imap = ProxyIMAP4(
+                        self.cfg['imap_server'],
+                        self.cfg['imap_port'],
+                        proxy_settings=self.proxy_settings,
+                    )
+
                 self.enable_tcp_keepalive()
                 self.imap.login(self.cfg['username'], self.cfg['password'])
                 log.info(f"账号 [{self.cfg['username']}] 登录成功")
-                
+
                 resp, _ = self.imap.select(self.cfg['folder'], readonly=False)
                 if resp != "OK":
                     raise Exception(f"无法定位监控文件夹: [{self.cfg['folder']}]，请检查配置。")
-                
+
+                self.refresh_last_seen_uid()
                 log.info(f"当前监控目标文件夹: [{self.cfg['folder']}]")
+                log.info(f"运行模式 -> {'DRY_RUN (仅记录日志，不推送、不改已读)' if self.dry_run else 'NORMAL'}")
                 return
             except Exception as e:
                 log.error(f"连接失败: {e}，将在 {self.RECONNECT_DELAY} 秒后重试...")
@@ -169,8 +215,8 @@ class MailMonitor:
         tag = f"A{self.idle_tag}"
         try:
             self.imap.send(f"{tag} IDLE\r\n".encode())
-            resp = self.imap.readline().decode()
-            if "+ idling" in resp.lower() or resp.startswith('+'):
+            resp = self.imap.readline().decode(errors="ignore").strip()
+            if resp.startswith('+'):
                 log.info("=== 成功进入 IDLE 待机监听状态 ===")
                 return tag
             log.warning(f"进入 IDLE 失败，响应: {resp}")
@@ -183,12 +229,80 @@ class MailMonitor:
         try:
             self.imap.send(b"DONE\r\n")
             while True:
-                line = self.imap.readline().decode(errors="ignore")
-                if tag in line or not line:
+                line = self.imap.readline()
+                if not line:
+                    break
+                text = line.decode(errors="ignore").strip()
+                if text.startswith(tag):
                     break
             return True
-        except:
+        except Exception:
             return False
+
+    def refresh_last_seen_uid(self):
+        status, data = self.imap.uid("search", None, "ALL")
+        if status != "OK" or not data or not data[0]:
+            self.last_seen_uid = 0
+            log.info("当前文件夹为空，UID 基线初始化为 0")
+            return
+
+        uid_list = [int(uid) for uid in data[0].split()]
+        self.last_seen_uid = max(uid_list)
+        log.info(f"UID 基线初始化完成，当前最新 UID = {self.last_seen_uid}")
+
+    def search_new_uids(self):
+        if self.last_seen_uid is None:
+            self.refresh_last_seen_uid()
+
+        status, data = self.imap.uid("search", None, f"UID {self.last_seen_uid + 1}:*")
+        if status != "OK" or not data or not data[0]:
+            return []
+
+        return [int(uid) for uid in data[0].split()]
+
+    def describe_new_uids(self, new_uids):
+        if not new_uids:
+            return "0 封"
+        if len(new_uids) == 1:
+            return f"1 封 (UID={new_uids[0]})"
+        return f"{len(new_uids)} 封 (UID={new_uids[0]}..{new_uids[-1]})"
+
+    def fetch_header_by_uid(self, uid):
+        status, msg_data = self.imap.uid("fetch", str(uid), "(BODY.PEEK[HEADER] UID)")
+        if status != "OK" or not msg_data:
+            return None, None
+
+        raw_email = None
+        fetched_uid = uid
+        for item in msg_data:
+            if not isinstance(item, tuple):
+                continue
+            meta, payload = item
+            raw_email = payload or raw_email
+            meta_text = meta.decode(errors="ignore") if isinstance(meta, bytes) else str(meta)
+            match = UID_PATTERN.search(meta_text)
+            if match:
+                fetched_uid = int(match.group(1))
+
+        return fetched_uid, raw_email
+
+    def mark_seen_by_uid(self, uid):
+        if self.dry_run:
+            log.info(f"DRY_RUN: 跳过将 UID={uid} 标记为已读")
+            return
+        self.imap.uid("store", str(uid), "+FLAGS", "(\\Seen)")
+
+    def handle_idle_line(self, line):
+        text = line.decode(errors="ignore").strip()
+        if not text:
+            return None
+        if "BYE" in text.upper():
+            log.warning(f"服务器主动断开连接: {text}")
+            return "ERROR"
+        if "EXISTS" in text.upper() or "RECENT" in text.upper():
+            log.info(f"[*] 检测到服务器信箱变化信号: {text}")
+            return "NEW_MAIL"
+        return None
 
     def wait_for_idle_events(self, tag):
         start = time.time()
@@ -207,29 +321,31 @@ class MailMonitor:
                 return "TIMEOUT"
 
             try:
-                # 使用代理时，某些底层实现可能会在 recv 时抛出 TimeoutError 而不是 socket.timeout
-                sock.settimeout(1.0)
-                data = sock.recv(4096)
-                if not data:
+                readable, _, _ = select.select([sock], [], [], 1.0)
+                if not readable:
+                    continue
+
+                line = self.imap.readline()
+                if not line:
                     log.warning("Socket 收到空数据 (EOF)，连接已被防火墙或对端悄悄切断。")
                     return "ERROR"
-                    
-                text = data.decode(errors="ignore")
-                if "EXISTS" in text or "RECENT" in text:
-                    log.info(f"[*] 检测到服务器信箱变化信号")
+
+                event = self.handle_idle_line(line)
+                if event:
                     self.exit_idle(tag)
-                    return "NEW_MAIL"
+                    return event
+            except (OSError, ValueError) as e:
+                log.error(f"Socket 监听异常中断: {e}")
+                return "ERROR"
             except (socket.timeout, TimeoutError):
-                # 正常超时，继续下一轮循环以检查心跳
                 continue
             except ssl.SSLError as e:
-                # 捕获 SSL 错误中的 The read operation timed out
                 if "timed out" in str(e).lower():
                     continue
                 log.error(f"SSL 监听异常中断: {e}")
                 return "ERROR"
-            except Exception as e:
-                log.error(f"Socket 监听异常中断: {e}")
+            except imaplib.IMAP4.abort as e:
+                log.error(f"IMAP 连接异常中断: {e}")
                 return "ERROR"
 
     def decode_mime_words(self, s):
@@ -240,33 +356,33 @@ class MailMonitor:
                 word.decode(encoding or 'utf-8') if isinstance(word, bytes) else word
                 for word, encoding in decode_header(str(s))
             )
-        except:
+        except Exception:
             return str(s)
 
     def process_new_mail(self):
         try:
             self.imap.noop()
-            resp, data = self.imap.search(None, "UNSEEN")
-            if resp != "OK" or not data or not data[0]:
+            new_uids = self.search_new_uids()
+            if not new_uids:
+                log.info(f"本次信箱变化未发现新增 UID，当前基线 UID = {self.last_seen_uid}")
                 return
 
-            msg_ids = data[0].split()
-            log.info(f"拉取到 {len(msg_ids)} 封未读新邮件")
+            log.info(f"发现新增邮件 -> {self.describe_new_uids(new_uids)}")
 
-            for msg_id in msg_ids:
-                typ, msg_data = self.imap.fetch(msg_id, "(RFC822.HEADER)")
-                if typ != "OK": continue
-
-                raw_email = msg_data[0][1]
+            for uid in new_uids:
+                fetched_uid, raw_email = self.fetch_header_by_uid(uid)
+                if not raw_email:
+                    log.warning(f"拉取 UID={uid} 的邮件头失败，已跳过")
+                    continue
                 msg = email.message_from_bytes(raw_email)
-                
+
                 subject = self.decode_mime_words(msg.get("Subject") or "无标题")
                 sender = self.decode_mime_words(msg.get("From") or "未知发件人")
 
-                log.info(f"解析提取 -> 主题: [{subject}] 发件人: [{sender}]")
+                log.info(f"解析提取 -> UID: [{fetched_uid}] 主题: [{subject}] 发件人: [{sender}]")
                 self.send_pushover(f"新邮件: {sender}", subject)
-
-                self.imap.store(msg_id, "+FLAGS", "\\Seen")
+                self.mark_seen_by_uid(fetched_uid)
+                self.last_seen_uid = max(self.last_seen_uid or 0, fetched_uid)
         except Exception as e:
             log.error(f"处理邮件过程中出错: {e}")
 
@@ -275,6 +391,10 @@ class MailMonitor:
         user = self.cfg.get('pushover_user')
         if not token or not user:
             log.warning("未配置 Pushover 凭证，跳过推送")
+            return
+
+        if self.dry_run:
+            log.info(f"DRY_RUN: 跳过 Pushover 推送 -> title=[{title}] message=[{message}]")
             return
 
         try:
@@ -338,6 +458,14 @@ def load_config():
     def get_val(env_key, json_key, default=None):
         return os.getenv(env_key, config_data.get(json_key, default))
 
+    def get_bool_val(env_key, json_key, default=False):
+        raw = os.getenv(env_key)
+        if raw is None:
+            raw = config_data.get(json_key, default)
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
     cfg = {
         "imap_server": get_val("IMAP_SERVER", "imap_server"),
         "imap_port": int(get_val("IMAP_PORT", "imap_port", 993)),
@@ -347,7 +475,8 @@ def load_config():
         "pushover_token": get_val("PUSHOVER_APP_TOKEN", "pushover_app_token"),
         "pushover_user": get_val("PUSHOVER_USER_KEY", "pushover_user_key"),
         "proxy_url": get_val("PROXY_URL", "proxy_url"),
-        "heartbeat_interval": int(get_val("HEARTBEAT_INTERVAL", "heartbeat_interval", 15))
+        "heartbeat_interval": int(get_val("HEARTBEAT_INTERVAL", "heartbeat_interval", 15)),
+        "dry_run": get_bool_val("DRY_RUN", "dry_run", False),
     }
 
     missing = [k for k in ["imap_server", "username", "password"] if not cfg[k]]
@@ -362,11 +491,6 @@ def load_config():
 if __name__ == "__main__":
     try:
         cfg = load_config()
-        
-        # 如果配置了代理，在一切网络请求开始前配置全局 Socket 代理
-        if cfg.get("proxy_url"):
-            configure_global_proxy(cfg["proxy_url"])
-            
         monitor = MailMonitor(cfg)
         monitor.run()
     except KeyboardInterrupt:
