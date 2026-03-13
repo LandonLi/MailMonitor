@@ -43,8 +43,9 @@ PUSHOVER_USER_KEY=your_pushover_user_key
 ```bash
 docker-compose up -d --build
 ```
+> **注意：** 项目默认会将日志挂载至宿主机的 `./logs` 目录，方便你直接通过 `cat logs/mail_monitor.log` 排查历史问题。
 
-### 3. 查看运行状态
+### 3. 查看实时运行日志
 ```bash
 docker logs -f mail-monitor
 ```
@@ -61,7 +62,7 @@ docker logs -f mail-monitor
 | `PUSHOVER_APP_TOKEN`| ✅ | - | 手机端 Pushover 申请的 App 令牌 |
 | `PUSHOVER_USER_KEY` | ✅ | - | 手机端 Pushover 的用户识别码 |
 | `PROXY_URL` | ❌ | - | 设置代理。格式：`socks5://ip:port` 或 `http://ip:port` |
-| `HEARTBEAT_INTERVAL`| ❌ | 15 | NOOP 心跳间隔(分钟)。若频繁断线(EOF)可将其调小，如 9 |
+| `HEARTBEAT_INTERVAL`| ❌ | 15 | NOOP 心跳间隔(分钟)。若频繁由于防火墙导致连接中断(EOF)，可调小至 9 |
 
 ## 🛠️ 本地 Python 运行
 
@@ -84,8 +85,8 @@ python mail_monitor.py
 - **Q: 为什么 Gmail 提示密码错误？**
   A: Gmail 强制要求第三方客户端使用“应用专用密码”。请前往 Google 账号设置中开启两步验证，并生成一个 16 位的应用密码填入 `EMAIL_PASSWORD`。
 
-- **Q: 为什么日志提示 `socket error: TLS/SSL connection has been closed (EOF)`？**
-  A: 你的云服务器或运营商网关对 TCP 长连接极其严苛，强行切断了空闲链路。程序会自动秒级重连恢复，属于正常抵抗网络波动的现象。如果频繁发生，可自行在代码中将 `HEARTBEAT_INTERVAL` 调小。
+- **Q: 日志提示 `Socket 收到空数据 (EOF)` 或连接被切断？**
+  A: 这通常意味着你的云服务器或运营商网关对 TCP 长连接极其严苛，在空闲时强行切断了链路。程序已针对此场景优化：会自动标记异常并触发秒级重连恢复，属于正常抵抗网络波动的现象。如果重连过于频繁（每 15 分钟一次），请尝试将 `HEARTBEAT_INTERVAL` 调小。
 
 - **Q: 如何排查连不上网/获取不到文件夹？**
   A: 程序启动时若连接失败会打印异常日志；若配置了代理请确认代理可用；另外检查 `MAIL_FOLDER` 的名称是否与你服务商真实存在的目录（如部分服务商归档目录为 `&XfJT0ZAB-` 这种编码格式）完全一致。
